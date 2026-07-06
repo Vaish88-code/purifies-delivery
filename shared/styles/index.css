@@ -1,0 +1,197 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 215 25% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 215 25% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 25% 15%;
+
+    --primary: 201 90% 32%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 142 71% 45%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 201 100% 95%;
+    --accent-foreground: 201 90% 32%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 201 90% 32%;
+
+    --radius: 0.75rem;
+
+    /* Custom tokens */
+    --water-gradient: linear-gradient(135deg, hsl(201 90% 32%) 0%, hsl(192 91% 36%) 50%, hsl(142 71% 45%) 100%);
+    --water-light: 201 100% 97%;
+    --water-medium: 201 90% 85%;
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 201 90% 32%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 201 100% 95%;
+    --sidebar-accent-foreground: 201 90% 32%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 201 90% 32%;
+  }
+
+  .dark {
+    --background: 215 28% 10%;
+    --foreground: 210 40% 98%;
+
+    --card: 215 28% 13%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 215 28% 13%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 201 90% 50%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 142 71% 45%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 215 28% 17%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 201 50% 20%;
+    --accent-foreground: 201 90% 70%;
+
+    --destructive: 0 62% 30%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 215 28% 20%;
+    --input: 215 28% 20%;
+    --ring: 201 90% 50%;
+
+    --sidebar-background: 215 28% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 201 90% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 201 50% 20%;
+    --sidebar-accent-foreground: 201 90% 70%;
+    --sidebar-border: 215 28% 20%;
+    --sidebar-ring: 201 90% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-semibold tracking-tight;
+  }
+}
+
+@layer utilities {
+  .water-gradient {
+    background: var(--water-gradient);
+  }
+
+  .water-gradient-text {
+    background: var(--water-gradient);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Slightly lighter green accent for hero heading */
+  .hero-heading-gradient {
+    background: linear-gradient(
+      135deg,
+      hsl(201 90% 40%) 0%,
+      hsl(192 91% 45%) 35%,
+      hsl(142 71% 60%) 75%,
+      hsl(142 71% 75%) 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .glass {
+    @apply bg-card/80 backdrop-blur-md border border-border/50;
+  }
+
+  .card-shadow {
+    box-shadow: 0 4px 24px -4px hsl(201 90% 32% / 0.1);
+  }
+
+  .card-shadow-hover {
+    box-shadow: 0 8px 32px -4px hsl(201 90% 32% / 0.15);
+  }
+
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  .animate-pulse-slow {
+    animation: pulse 3s ease-in-out infinite;
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.5s ease-out forwards;
+}
+
+.animate-slide-up-delay-1 {
+  animation: slide-up 0.5s ease-out 0.1s forwards;
+  opacity: 0;
+}
+
+.animate-slide-up-delay-2 {
+  animation: slide-up 0.5s ease-out 0.2s forwards;
+  opacity: 0;
+}
+
+.animate-slide-up-delay-3 {
+  animation: slide-up 0.5s ease-out 0.3s forwards;
+  opacity: 0;
+}
+
