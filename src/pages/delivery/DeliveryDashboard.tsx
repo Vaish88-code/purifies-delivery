@@ -467,7 +467,7 @@ export default function DeliveryDashboard() {
         throw new Error('Order not found');
       }
 
-      // Use live map legend km when this order is on the map; never reuse admin-assign estimate
+      // Use live map legend km when this order is on the map
       const mapOpenForOrder = selectedOrderId === (order.id || order.orderId);
       let driverToShopKm: number | undefined =
         mapOpenForOrder && kmDriverToShop != null ? kmDriverToShop : undefined;
@@ -484,7 +484,7 @@ export default function DeliveryDashboard() {
         shopToCustomerKm = order.shopToCustomerKm;
       }
 
-      // Always compute from driver's live GPS (same OSRM routes as the map: Blue + Green)
+      // Try to compute from driver's live GPS
       if (driverToShopKm == null || shopToCustomerKm == null) {
         let vendor: Awaited<ReturnType<typeof getVendorByUid>> = null;
         try {
@@ -498,46 +498,48 @@ export default function DeliveryDashboard() {
           ? (driverPosition as [number, number])[1]
           : undefined;
 
-        const trip = await computeDeliveryMapTotalDistance({
-          driverLat,
-          driverLng,
-          shopLat: vendor?.latitude ?? order.vendorLatitude,
-          shopLng: vendor?.longitude ?? order.vendorLongitude,
-          shopAddress: vendor?.address ?? order.vendorAddress,
-          shopName: order.vendorShopName,
-          shopPincode: vendor?.pincode,
-          customerLat: order.latitude,
-          customerLng: order.longitude,
-          customerAddress: order.customerAddress,
-          customerPincode: order.customerPincode,
-        });
-        driverToShopKm = trip.driverToShopKm ?? driverToShopKm;
-        shopToCustomerKm = trip.shopToCustomerKm ?? shopToCustomerKm;
+        try {
+          const trip = await computeDeliveryMapTotalDistance({
+            driverLat,
+            driverLng,
+            shopLat: vendor?.latitude ?? order.vendorLatitude,
+            shopLng: vendor?.longitude ?? order.vendorLongitude,
+            shopAddress: vendor?.address ?? order.vendorAddress,
+            shopName: order.vendorShopName,
+            shopPincode: vendor?.pincode,
+            customerLat: order.latitude,
+            customerLng: order.longitude,
+            customerAddress: order.customerAddress,
+            customerPincode: order.customerPincode,
+          });
+          driverToShopKm = trip.driverToShopKm ?? driverToShopKm;
+          shopToCustomerKm = trip.shopToCustomerKm ?? shopToCustomerKm;
+        } catch (e) {
+          console.warn('Distance computation failed, will use fallback:', e);
+        }
       }
 
-      let totalKm: number | undefined;
-      
+      // Calculate total — use whatever we have, default to 0 if nothing works
+      let totalKm: number;
       if (driverToShopKm != null && shopToCustomerKm != null) {
         totalKm = Math.round((driverToShopKm + shopToCustomerKm) * 100) / 100;
       } else if (shopToCustomerKm != null) {
         totalKm = Math.round(shopToCustomerKm * 100) / 100;
       } else if (driverToShopKm != null) {
         totalKm = Math.round(driverToShopKm * 100) / 100;
-      }
-
-      if (totalKm == null) {
-        throw new Error(
-          'Could not calculate trip distance. Open the map or enable location, then try again.'
-        );
+      } else {
+        // Fallback: mark delivered with 0 km — admin can fix via Update Summary
+        totalKm = 0;
+        console.warn('All distance methods failed. Marking delivered with 0 km.');
       }
 
       await updateOrderDocument(orderId, {
         status: 'delivered',
         deliveredAt: Timestamp.now(),
-        driverToShopKm,
-        shopToCustomerKm,
+        driverToShopKm: driverToShopKm ?? 0,
+        shopToCustomerKm: shopToCustomerKm ?? 0,
         distanceKm: totalKm,
-        mapKmFromDelivery: true,
+        mapKmFromDelivery: driverToShopKm != null || shopToCustomerKm != null,
       });
       try {
         await finalizeDriverEarningsForOrder(orderId, user.id);
@@ -552,9 +554,9 @@ export default function DeliveryDashboard() {
       toast({
         title: 'Marked as Delivered',
         description:
-          totalKm != null
-            ? `Saved · Total ${totalKm.toFixed(2)} km transferred to admin records.`
-            : 'Order completed and saved to delivery records.',
+          totalKm > 0
+            ? `Trip logged: ${totalKm} km`
+            : 'Delivery completed. Distance will be updated by admin.',
       });
     } catch (error: any) {
       console.error('Error marking order as delivered:', error);
