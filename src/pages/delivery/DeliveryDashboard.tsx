@@ -515,10 +515,15 @@ export default function DeliveryDashboard() {
         shopToCustomerKm = trip.shopToCustomerKm ?? shopToCustomerKm;
       }
 
-      const totalKm =
-        driverToShopKm != null && shopToCustomerKm != null
-          ? Math.round((driverToShopKm + shopToCustomerKm) * 100) / 100
-          : undefined;
+      let totalKm: number | undefined;
+      
+      if (driverToShopKm != null && shopToCustomerKm != null) {
+        totalKm = Math.round((driverToShopKm + shopToCustomerKm) * 100) / 100;
+      } else if (shopToCustomerKm != null) {
+        totalKm = Math.round(shopToCustomerKm * 100) / 100;
+      } else if (driverToShopKm != null) {
+        totalKm = Math.round(driverToShopKm * 100) / 100;
+      }
 
       if (totalKm == null) {
         throw new Error(
