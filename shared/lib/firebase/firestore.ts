@@ -6,6 +6,7 @@ import {
   getDocs,
   addDoc,
   updateDoc,
+  runTransaction,
   Timestamp,
   query,
   where,
@@ -14,15 +15,19 @@ import {
   onSnapshot,
   Unsubscribe,
   deleteField,
+  deleteDoc,
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
-import { db, storage } from '../firebase';
+import { db, storage, auth } from '../firebase';
 import { Language, UserRole } from '@shared/contexts/AuthContext';
 import {
   cityKeyForMatching,
   statesCompatibleForAreaMatch,
   distanceMetersShopToPerson,
+  computeDeliveryMapTotalDistance,
 } from '@shared/utils/geo';
+import { calculateOrderFeeSplit, PLATFORM_FEES } from '@shared/utils/platformFees';
+import { orderTripTotalKm, todayKey, recordTotalKm } from '@shared/utils/deliveryOrderFilters';
 
 export interface UpiPaymentMethod {
   id: string;
@@ -50,6 +55,30 @@ export interface FirestoreUser {
   locationPermissionGranted?: boolean;
   locationUpdatedAt?: Timestamp;
   paymentMethods?: UpiPaymentMethod[];
+  /** Driver wallet: accrued earnings available to withdraw */
+  walletBalance?: number;
+  /** Driver lifetime earnings (all time) */
+  totalEarnings?: number;
+  /** Driver completed delivery count */
+  lifetimeDeliveries?: number;
+  /** UPI ID for driver payouts */
+  payoutUpiId?: string;
+  driverTier?: 'bronze' | 'silver' | 'gold' | 'diamond';
+  monthlyOrderCount?: number;
+  streakCount?: number;
+  acceptanceRate?: number;
+  bankAccount?: {
+    accountNumber?: string;
+    ifsc?: string;
+    beneficiaryName?: string;
+  };
+  fcmToken?: string;
+  /** Profile photo for admin/driver directory */
+  profilePhotoUrl?: string;
+  /** Aadhaar for KYC (admin verification) */
+  aadhaarNumber?: string;
+  aadhaarVerified?: boolean;
+  kycStatus?: 'pending' | 'verified' | 'rejected';
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -108,13 +137,75 @@ export interface Order {
   }[];
   subtotal: number;
   deliveryFee: number;
+  /** Optional customer tip — 100% goes to driver */
+  tip?: number;
   total: number;
+  /** Platform commission on subtotal (₹) */
+  platformCommission?: number;
+  /** Commission rate applied (%) */
+  commissionPercent?: number;
+  /** Vendor net from product sales after commission */
+  vendorAmount?: number;
+  /** Driver base + delivery fee share (excludes tip) */
+  driverFee?: number;
+  /** Driver tip amount */
+  driverTip?: number;
+  /** Total driver earnings for this order */
+  driverTotalEarnings?: number;
+  /** Platform revenue (commission + any delivery fee kept) */
+  platformRevenue?: number;
+  /** Whether driver earnings have been credited */
+  driverEarningsFinalized?: boolean;
   deliveryType: 'today' | 'schedule' | 'subscription';
   scheduledDate?: string;
   scheduledTime?: string;
   /** When order is created from subscription delivery, links to that subscription doc id for correct jar counting */
   subscriptionId?: string;
   status: 'pending' | 'accepted' | 'rejected' | 'preparing' | 'out_for_delivery' | 'delivered' | 'cancelled';
+  /** Vendor requested admin to assign a driver */
+  deliveryRequestedAt?: Timestamp;
+  /** Admin-mediated driver assignment (Swiggy-style) */
+  assignmentStatus?:
+    | 'awaiting_admin'
+    | 'admin_assigned'
+    | 'searching'
+    | 'offered'
+    | 'assigned'
+    | 'failed'
+    | 'manual';
+  adminAssignedAt?: Timestamp;
+  adminAssignedBy?: string;
+  /** Total jars in this order (for driver pay) */
+  jarCount?: number;
+  /** Legacy auto-assign fields */
+  autoAssignDriver?: boolean;
+  assignmentQueue?: string[];
+  assignmentCursor?: number;
+  currentAssignmentId?: string;
+  assignmentFailureReason?: string;
+  vendorLatitude?: number;
+  vendorLongitude?: number;
+  /** Razorpay / gateway payment tracking */
+  paymentStatus?: 'pending' | 'paid' | 'failed' | 'refunded';
+  razorpayOrderId?: string;
+  razorpayPaymentId?: string;
+  paymentMethod?: 'upi' | 'card' | 'netbanking' | 'wallet' | 'upi_direct';
+  /** Total trip distance (driver → shop → customer) in km */
+  distanceKm?: number;
+  /** Driver GPS location → shop (pickup) km at assignment time */
+  driverToShopKm?: number;
+  /** Shop → customer drop-off km */
+  shopToCustomerKm?: number;
+  /** Km saved from delivery app map at mark-delivered — do not overwrite on admin */
+  mapKmFromDelivery?: boolean;
+  /** When driver starts trip */
+  deliveryStartedAt?: Timestamp;
+  /** When driver marks delivered */
+  deliveredAt?: Timestamp;
+  /** Admin confirmed delivery record */
+  adminVerified?: boolean;
+  adminVerifiedAt?: Timestamp;
+  adminVerifiedBy?: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -185,7 +276,35 @@ export interface Payment {
   vendorUid: string;
   vendorShopName: string;
   amount: number;
-  status: 'INITIATED' | 'SUCCESS' | 'FAILED';
+  status: 'INITIATED' | 'PAYMENT_REQUESTED' | 'SUCCESS' | 'FAILED' | 'PAID';
+  /** Fee split fields (for Razorpay Route / reconciliation) */
+  tip?: number;
+  platformCommission?: number;
+  vendorAmount?: number;
+  driverFee?: number;
+  driverTip?: number;
+  splitStatus?: 'pending' | 'completed' | 'manual';
+  gatewayProvider?: 'upi_direct' | 'razorpay_route' | 'cashfree_split';
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+/** Driver payout record — one per completed delivery */
+export interface DriverPayout {
+  id?: string;
+  orderId: string;
+  orderOrderId: string;
+  driverUid: string;
+  driverName?: string;
+  vendorUid: string;
+  amount: number;
+  baseFee: number;
+  deliveryFeeShare: number;
+  tip: number;
+  surgeBonus?: number;
+  milestoneBonus?: number;
+  status: 'pending' | 'completed' | 'withdrawn';
+  paidAt?: Timestamp;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -228,6 +347,29 @@ export const getUserDocument = async (uid: string): Promise<FirestoreUser | null
     }
     throw error;
   }
+};
+
+/** Live subscribe to a user doc — used by admin to track delivery person GPS. */
+export const subscribeToUserDocument = (
+  uid: string,
+  callback: (user: FirestoreUser | null) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const userDocRef = doc(db, 'users', uid);
+  return onSnapshot(
+    userDocRef,
+    (snap) => {
+      if (!snap.exists()) {
+        callback(null);
+        return;
+      }
+      callback(snap.data() as FirestoreUser);
+    },
+    (err) => {
+      console.error('subscribeToUserDocument error:', err);
+      onError?.(err as Error);
+    }
+  );
 };
 
 // Update user document
@@ -572,6 +714,14 @@ export const createOrderDocument = async (
   orderData: Omit<Order, 'id' | 'orderId' | 'createdAt' | 'updatedAt'>
 ): Promise<{ docId: string; orderId: string }> => {
   try {
+    const authUid = auth.currentUser?.uid;
+    if (!authUid) {
+      throw new Error('You must be signed in to place an order.');
+    }
+    if (orderData.customerUid !== authUid) {
+      throw new Error('Order customer does not match signed-in user.');
+    }
+
     const orderId = generateOrderId();
     const now = Timestamp.now();
     
@@ -1542,6 +1692,14 @@ export const createPaymentDocument = async (
   paymentData: Omit<Payment, 'id' | 'createdAt' | 'updatedAt'>
 ): Promise<string> => {
   try {
+    const authUid = auth.currentUser?.uid;
+    if (!authUid) {
+      throw new Error('You must be signed in to create a payment.');
+    }
+    if (paymentData.customerUid !== authUid) {
+      throw new Error('Payment customer does not match signed-in user.');
+    }
+
     const now = Timestamp.now();
     const cleaned: any = {
       ...paymentData,
@@ -1568,11 +1726,20 @@ export const createPaymentDocument = async (
   }
 };
 
-// Get a single payment document by orderId (used in OrderTracking)
-export const getPaymentByOrderId = async (orderId: string): Promise<Payment | null> => {
+// Get a single payment document by orderId (scoped to customer or vendor for security rules)
+export const getPaymentByOrderId = async (
+  orderId: string,
+  scope?: { customerUid?: string; vendorUid?: string }
+): Promise<Payment | null> => {
   try {
     const paymentsRef = collection(db, 'payments');
-    const q = query(paymentsRef, where('orderId', '==', orderId));
+    const constraints = [where('orderId', '==', orderId)];
+    if (scope?.customerUid) {
+      constraints.push(where('customerUid', '==', scope.customerUid));
+    } else if (scope?.vendorUid) {
+      constraints.push(where('vendorUid', '==', scope.vendorUid));
+    }
+    const q = query(paymentsRef, ...constraints);
     const snapshot = await getDocs(q);
 
     if (snapshot.empty) {
@@ -1850,4 +2017,1297 @@ export const calculateMonthlyAmount = (
     savings: Math.round(discountAmount),
     deliveriesPerMonth,
   };
+};
+
+// ─── Driver payouts & earnings finalization ───────────────────────────────────
+
+/** Credit driver earnings when order is marked delivered. Idempotent per order. */
+export const finalizeDriverEarningsForOrder = async (
+  orderDocId: string,
+  driverUid: string
+): Promise<void> => {
+  const orderRef = doc(db, 'orders', orderDocId);
+  const orderSnap = await getDoc(orderRef);
+  if (!orderSnap.exists()) throw new Error('Order not found');
+
+  const order = { id: orderSnap.id, ...orderSnap.data() } as Order;
+  if (order.driverEarningsFinalized) return;
+  if (order.status !== 'delivered') throw new Error('Order must be delivered first');
+  if (order.deliveryPersonUid && order.deliveryPersonUid !== driverUid) {
+    throw new Error('Driver mismatch for this order');
+  }
+
+  const split = calculateOrderFeeSplit(
+    order.subtotal,
+    order.deliveryFee ?? 0,
+    order.tip ?? 0,
+    order.commissionPercent ?? PLATFORM_FEES.baseCommissionPercent,
+    { applySurgeBonus: true, distanceKm: order.distanceKm ?? 0 }
+  );
+
+  const driverAmount =
+    order.driverTotalEarnings ??
+    (order.driverFee != null ? order.driverFee + (order.driverTip ?? 0) : split.driverTotalEarnings);
+  const now = Timestamp.now();
+
+  const payoutDoc: Omit<DriverPayout, 'id'> = {
+    orderId: orderDocId,
+    orderOrderId: order.orderId,
+    driverUid,
+    driverName: order.deliveryPersonName,
+    vendorUid: order.vendorUid,
+    amount: driverAmount,
+    baseFee: order.driverFee ?? split.driverBaseFee,
+    deliveryFeeShare: split.driverDeliveryShare,
+    tip: order.driverTip ?? split.driverTip,
+    surgeBonus: split.driverBaseFee > PLATFORM_FEES.driverBaseFeePerDelivery
+      ? PLATFORM_FEES.surgeBonusPerDelivery
+      : 0,
+    status: 'completed',
+    paidAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await addDoc(collection(db, 'driverPayouts'), payoutDoc);
+
+  const driverRef = doc(db, 'users', driverUid);
+  const driverSnap = await getDoc(driverRef);
+  const driverData = driverSnap.data() as FirestoreUser | undefined;
+  const prevBalance = driverData?.walletBalance ?? 0;
+  const prevTotal = driverData?.totalEarnings ?? 0;
+  const prevDeliveries = driverData?.lifetimeDeliveries ?? 0;
+
+  await updateDoc(driverRef, {
+    walletBalance: prevBalance + driverAmount,
+    totalEarnings: prevTotal + driverAmount,
+    lifetimeDeliveries: prevDeliveries + 1,
+    updatedAt: now,
+  });
+
+  await updateDoc(orderRef, {
+    driverEarningsFinalized: true,
+    driverFee: order.driverFee ?? split.driverBaseFee + split.driverDeliveryShare,
+    driverTip: order.driverTip ?? split.driverTip,
+    driverTotalEarnings: driverAmount,
+    updatedAt: now,
+  });
+};
+
+export const subscribeToDriverPayouts = (
+  driverUid: string,
+  callback: (payouts: DriverPayout[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  try {
+    const ref = collection(db, 'driverPayouts');
+    const q = query(ref, where('driverUid', '==', driverUid), orderBy('createdAt', 'desc'));
+    return onSnapshot(
+      q,
+      (snap) => {
+        callback(
+          snap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverPayout)
+        );
+      },
+      (err) => {
+        console.error('subscribeToDriverPayouts error:', err);
+        onError?.(err as Error);
+      }
+    );
+  } catch (error) {
+    console.error('Failed subscribeToDriverPayouts:', error);
+    onError?.(error as Error);
+    return () => {};
+  }
+};
+
+/** Request withdrawal of wallet balance (UPI payout — integrate Razorpay/Cashfree here). */
+export const requestDriverWithdrawal = async (
+  driverUid: string,
+  amount: number
+): Promise<{ success: boolean; error?: string }> => {
+  try {
+    const driverRef = doc(db, 'users', driverUid);
+    const driverSnap = await getDoc(driverRef);
+    if (!driverSnap.exists()) return { success: false, error: 'Driver not found' };
+
+    const driver = driverSnap.data() as FirestoreUser;
+    const balance = driver.walletBalance ?? 0;
+    if (amount <= 0 || amount > balance) {
+      return { success: false, error: 'Invalid withdrawal amount' };
+    }
+    if (!driver.payoutUpiId) {
+      return { success: false, error: 'Add your UPI ID in profile to withdraw' };
+    }
+
+    const now = Timestamp.now();
+    await updateDoc(driverRef, {
+      walletBalance: balance - amount,
+      updatedAt: now,
+    });
+
+    await addDoc(collection(db, 'driverPayouts'), {
+      orderId: 'withdrawal',
+      orderOrderId: `WD-${Date.now()}`,
+      driverUid,
+      driverName: driver.name,
+      vendorUid: '',
+      amount: -amount,
+      baseFee: 0,
+      deliveryFeeShare: 0,
+      tip: 0,
+      status: 'withdrawn',
+      paidAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return { success: true };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Withdrawal failed';
+    return { success: false, error: message };
+  }
+};
+
+export type DriverAssignmentStatus = 'pending' | 'accepted' | 'rejected' | 'expired' | 'cancelled';
+
+export interface DriverAssignment {
+  id?: string;
+  orderId: string;
+  orderOrderId: string;
+  vendorUid: string;
+  vendorShopName: string;
+  vendorAddress?: string;
+  vendorLatitude?: number;
+  vendorLongitude?: number;
+  customerName: string;
+  customerAddress: string;
+  deliveryFee: number;
+  total: number;
+  itemsSummary?: string;
+  driverUid: string;
+  driverName: string;
+  score?: number;
+  status: DriverAssignmentStatus;
+  expiresAt: Timestamp;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  respondedAt?: Timestamp;
+}
+
+/** Real-time pending assignment offers for a driver (auto-assign popup). */
+export const subscribeToPendingDriverAssignments = (
+  driverUid: string,
+  callback: (assignments: DriverAssignment[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  try {
+    const ref = collection(db, 'driverAssignments');
+    const q = query(ref, where('driverUid', '==', driverUid));
+    return onSnapshot(
+      q,
+      (snap) => {
+        const nowMs = Date.now();
+        const assignments = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }) as DriverAssignment)
+          .filter(
+            (assignment) =>
+              assignment.status === 'pending' &&
+              assignment.expiresAt?.toMillis?.() != null &&
+              assignment.expiresAt.toMillis() > nowMs
+          )
+          .sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+        callback(assignments);
+      },
+      (err) => {
+        console.error('subscribeToPendingDriverAssignments error:', err);
+        onError?.(err as Error);
+      }
+    );
+  } catch (error) {
+    console.error('Failed subscribeToPendingDriverAssignments:', error);
+    onError?.(error as Error);
+    return () => {};
+  }
+};
+
+// ─── Admin delivery management (Swiggy-style) ────────────────────────────────
+
+export interface DriverDailyPayout {
+  id?: string;
+  driverUid: string;
+  driverName: string;
+  date: string;
+  jarsDelivered: number;
+  distanceKm: number;
+  amount: number;
+  basePay?: number;
+  distanceFee?: number;
+  jarFee?: number;
+  incentive?: number;
+  payoutUpiId?: string;
+  status: 'pending' | 'paid';
+  orderIds: string[];
+  /** Completed trips — matches admin Delivery Records count */
+  tripCount?: number;
+  paidAt?: Timestamp;
+  paidByAdminUid?: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+export interface DriverDeliveryRecord {
+  id?: string;
+  orderId: string;
+  orderOrderId: string;
+  driverUid: string;
+  driverName: string;
+  vendorShopName: string;
+  vendorAddress?: string;
+  customerAddress: string;
+  customerName?: string;
+  jarCount: number;
+  distanceKm?: number;
+  driverToShopKm?: number;
+  shopToCustomerKm?: number;
+  driverEarnings: number;
+  deliveryDate: string;
+  assignedAt?: Timestamp;
+  deliveryStartedAt?: Timestamp;
+  deliveredAt?: Timestamp;
+  durationMinutes?: number;
+  verifiedAt: Timestamp;
+  /** Admin uid when manually verified; driver/system when auto-archived on deliver */
+  verifiedByAdminUid?: string;
+  createdAt: Timestamp;
+}
+
+export const uploadDriverProfilePhoto = async (
+  driverUid: string,
+  imageFile: File
+): Promise<string> => {
+  if (!imageFile.type.startsWith('image/')) {
+    throw new Error('File must be an image');
+  }
+  const maxSize = 5 * 1024 * 1024;
+  if (imageFile.size > maxSize) {
+    throw new Error('Image must be under 5MB');
+  }
+  const sanitizedFileName = imageFile.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+  const imagePath = `driver-profiles/${driverUid}/${Date.now()}_${sanitizedFileName}`;
+  const imageRef = ref(storage, imagePath);
+  const snapshot = await uploadBytes(imageRef, imageFile, { contentType: imageFile.type });
+  return getDownloadURL(snapshot.ref);
+};
+
+export const getAllDeliveryPersons = async (): Promise<FirestoreUser[]> => {
+  const usersRef = collection(db, 'users');
+  const q = query(usersRef, where('role', '==', 'delivery'));
+  const snap = await getDocs(q);
+  return snap.docs.map((d) => d.data() as FirestoreUser);
+};
+
+export const subscribeToOrdersAwaitingAdmin = (
+  callback: (orders: Order[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const ref = collection(db, 'orders');
+  const q = query(ref, orderBy('createdAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const orders = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as Order)
+        .filter((o) => o.assignmentStatus === 'awaiting_admin' && !o.deliveryPersonUid);
+      callback(orders);
+    },
+    (err) => {
+      console.error('subscribeToOrdersAwaitingAdmin error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const subscribeToAllOrdersForAdmin = (
+  callback: (orders: Order[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const ref = collection(db, 'orders');
+  const q = query(ref, orderBy('createdAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as Order));
+    },
+    (err) => {
+      console.error('subscribeToAllOrdersForAdmin error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const adminAssignDriverToOrder = async (
+  orderId: string,
+  driver: Pick<FirestoreUser, 'uid' | 'name' | 'phone'>,
+  distanceKm: number,
+  driverPay: { total: number; basePay: number; distanceFee: number; jarFee: number },
+  adminUid: string,
+  distanceBreakdown?: { driverToShopKm?: number; shopToCustomerKm?: number }
+): Promise<void> => {
+  const now = Timestamp.now();
+  const updates: Record<string, unknown> = {
+    deliveryPersonUid: driver.uid,
+    deliveryPersonName: driver.name,
+    deliveryPersonPhone: driver.phone,
+    assignmentStatus: 'admin_assigned',
+    status: 'accepted',
+    autoAssignDriver: false,
+    distanceKm,
+    driverFee: driverPay.basePay + driverPay.distanceFee + driverPay.jarFee,
+    driverTotalEarnings: driverPay.total,
+    adminAssignedAt: now,
+    adminAssignedBy: adminUid,
+    updatedAt: now,
+  };
+  if (distanceBreakdown?.driverToShopKm != null) {
+    updates.driverToShopKm = distanceBreakdown.driverToShopKm;
+  }
+  if (distanceBreakdown?.shopToCustomerKm != null) {
+    updates.shopToCustomerKm = distanceBreakdown.shopToCustomerKm;
+  }
+  await updateDoc(doc(db, 'orders', orderId), updates);
+};
+
+export const requestDeliveryFromAdmin = async (
+  orderId: string,
+  vendorData: { address?: string; phone?: string; latitude?: number; longitude?: number },
+  jarCount: number
+): Promise<void> => {
+  const now = Timestamp.now();
+  await updateDoc(doc(db, 'orders', orderId), {
+    status: 'accepted',
+    assignmentStatus: 'awaiting_admin',
+    autoAssignDriver: false,
+    deliveryRequestedAt: now,
+    jarCount,
+    ...(vendorData.address ? { vendorAddress: vendorData.address } : {}),
+    ...(vendorData.phone ? { vendorPhone: vendorData.phone } : {}),
+    ...(vendorData.latitude != null ? { vendorLatitude: vendorData.latitude } : {}),
+    ...(vendorData.longitude != null ? { vendorLongitude: vendorData.longitude } : {}),
+    updatedAt: now,
+  });
+};
+
+export const getDriverDeliveredOrdersForDate = async (
+  driverUid: string,
+  dateStr: string
+): Promise<Order[]> => {
+  const ref = collection(db, 'orders');
+  const q = query(
+    ref,
+    where('deliveryPersonUid', '==', driverUid),
+    where('status', '==', 'delivered')
+  );
+  const snap = await getDocs(q);
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }) as Order)
+    .filter((o) => {
+      const doneAt = o.deliveredAt ?? o.updatedAt;
+      if (!doneAt) return false;
+      return todayKey(doneAt.toDate()) === normalizePayoutDate(dateStr);
+    });
+};
+
+export const getDriverDeliveryRecordsForDate = async (
+  driverUid: string,
+  dateStr: string
+): Promise<DriverDeliveryRecord[]> => {
+  const normalized = normalizePayoutDate(dateStr);
+  const snap = await getDocs(
+    query(collection(db, 'driverDeliveryRecords'), where('driverUid', '==', driverUid))
+  );
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }) as DriverDeliveryRecord)
+    .filter((r) => normalizePayoutDate(r.deliveryDate) === normalized);
+};
+
+export function normalizePayoutDate(date: string): string {
+  const parts = String(date || '').split('-');
+  if (parts.length !== 3) return date;
+  const [y, m, d] = parts;
+  return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+}
+
+export function driverDailyPayoutDocId(driverUid: string, dateStr: string): string {
+  return `${driverUid}_${normalizePayoutDate(dateStr)}`;
+}
+
+function preferDriverDailyPayout(a: DriverDailyPayout, b: DriverDailyPayout): DriverDailyPayout {
+  const canonicalA = a.id === driverDailyPayoutDocId(a.driverUid, normalizePayoutDate(a.date));
+  const canonicalB = b.id === driverDailyPayoutDocId(b.driverUid, normalizePayoutDate(b.date));
+  if (canonicalA && !canonicalB) return a;
+  if (canonicalB && !canonicalA) return b;
+  if (a.status === 'paid' && b.status !== 'paid') return a;
+  if (b.status === 'paid' && a.status !== 'paid') return b;
+  return (a.updatedAt?.toMillis?.() ?? 0) >= (b.updatedAt?.toMillis?.() ?? 0) ? a : b;
+}
+
+export function normalizeTripText(value: string): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+/** Same dedupe rules for admin Records and driver Payouts — one row per real delivery. */
+export function dedupeDriverDeliveryRecords(
+  records: DriverDeliveryRecord[]
+): DriverDeliveryRecord[] {
+  const pickNewer = (a: DriverDeliveryRecord, b: DriverDeliveryRecord) =>
+    (a.verifiedAt?.toMillis?.() ?? 0) >= (b.verifiedAt?.toMillis?.() ?? 0) ? a : b;
+
+  const byFirestore = new Map<string, DriverDeliveryRecord>();
+  for (const record of records) {
+    const firestoreId = String(record.orderId || record.id || '').trim();
+    if (!firestoreId) continue;
+    byFirestore.set(
+      firestoreId,
+      byFirestore.has(firestoreId) ? pickNewer(byFirestore.get(firestoreId)!, record) : record
+    );
+  }
+
+  const byBusiness = new Map<string, DriverDeliveryRecord>();
+  for (const record of byFirestore.values()) {
+    const businessId = String(record.orderOrderId || '').trim();
+    if (businessId) {
+      byBusiness.set(
+        businessId,
+        byBusiness.has(businessId) ? pickNewer(byBusiness.get(businessId)!, record) : record
+      );
+      continue;
+    }
+    byBusiness.set(`f:${record.orderId || record.id}`, record);
+  }
+
+  const byTrip = new Map<string, DriverDeliveryRecord>();
+  for (const record of byBusiness.values()) {
+    const tripKey = [
+      normalizePayoutDate(record.deliveryDate),
+      record.driverUid,
+      normalizeTripText(record.customerAddress || record.customerName || ''),
+      normalizeTripText(record.vendorShopName || ''),
+    ].join('|');
+    byTrip.set(tripKey, byTrip.has(tripKey) ? pickNewer(byTrip.get(tripKey)!, record) : record);
+  }
+  return [...byTrip.values()];
+}
+
+/** Totals for one day from deduped delivery records (matches admin Records). */
+export function summarizeDeliveryRecordsForDate(
+  records: DriverDeliveryRecord[],
+  dateStr: string
+): {
+  tripCount: number;
+  jarsDelivered: number;
+  distanceKm: number;
+  amount: number;
+} {
+  const normalized = normalizePayoutDate(dateStr);
+  const dayRecords = records.filter(
+    (r) => normalizePayoutDate(r.deliveryDate) === normalized
+  );
+  return {
+    tripCount: dayRecords.length,
+    jarsDelivered: dayRecords.reduce((s, r) => s + (r.jarCount ?? 0), 0),
+    distanceKm:
+      Math.round(dayRecords.reduce((s, r) => s + deliveryRecordTripKm(r), 0) * 100) / 100,
+    amount: dayRecords.reduce((s, r) => s + (r.driverEarnings ?? 0), 0),
+  };
+}
+
+function uniqueOrdersForPayout(orders: Order[]): Order[] {
+  const pickNewer = (a: Order, b: Order) =>
+    (a.deliveredAt?.toMillis?.() ?? a.updatedAt?.toMillis?.() ?? 0) >=
+    (b.deliveredAt?.toMillis?.() ?? b.updatedAt?.toMillis?.() ?? 0)
+      ? a
+      : b;
+
+  const byBusiness = new Map<string, Order>();
+  const byId = new Map<string, Order>();
+
+  for (const order of orders) {
+    if (order.id) byId.set(order.id, order);
+    const businessId = String(order.orderId || '').trim();
+    if (businessId) {
+      byBusiness.set(
+        businessId,
+        byBusiness.has(businessId) ? pickNewer(byBusiness.get(businessId)!, order) : order
+      );
+    }
+  }
+
+  const merged = new Map<string, Order>();
+  for (const order of byBusiness.values()) {
+    merged.set(`b:${order.orderId}`, order);
+  }
+  for (const order of byId.values()) {
+    const businessId = String(order.orderId || '').trim();
+    if (businessId && [...merged.values()].some((o) => o.orderId === businessId)) continue;
+    merged.set(`f:${order.id}`, order);
+  }
+
+  const byTrip = new Map<string, Order>();
+  for (const order of merged.values()) {
+    const doneAt = order.deliveredAt ?? order.updatedAt;
+    const tripKey = [
+      doneAt ? todayKey(doneAt.toDate()) : '',
+      normalizeTripText(order.customerAddress || order.customerName || ''),
+      normalizeTripText(order.vendorShopName || ''),
+    ].join('|');
+    byTrip.set(tripKey, byTrip.has(tripKey) ? pickNewer(byTrip.get(tripKey)!, order) : order);
+  }
+  return [...byTrip.values()];
+}
+
+function deliveryRecordTripKm(record: DriverDeliveryRecord): number {
+  return recordTotalKm(record);
+}
+
+function aggregatePayoutTotals(
+  records: DriverDeliveryRecord[],
+  orders: Order[]
+): {
+  jarsDelivered: number;
+  distanceKm: number;
+  amount: number;
+  orderIds: string[];
+  tripCount: number;
+} {
+  const orderById = new Map(orders.filter((o) => o.id).map((o) => [o.id!, o]));
+
+  if (records.length > 0) {
+    return {
+      jarsDelivered: records.reduce((s, r) => s + (r.jarCount ?? 0), 0),
+      distanceKm: records.reduce((s, r) => {
+        const order = orderById.get(r.orderId);
+        if (order?.mapKmFromDelivery) {
+          return s + orderTripTotalKm(order);
+        }
+        return s + deliveryRecordTripKm(r);
+      }, 0),
+      amount: records.reduce((s, r) => s + (r.driverEarnings ?? 0), 0),
+      orderIds: records.map((r) => r.orderId).filter(Boolean),
+      tripCount: records.length,
+    };
+  }
+
+  return {
+    jarsDelivered: orders.reduce((s, o) => s + countJarsFromItems(o.items), 0),
+    distanceKm: orders.reduce((s, o) => s + orderTripTotalKm(o), 0),
+    amount: orders.reduce((s, o) => s + (o.driverTotalEarnings ?? o.driverFee ?? 0), 0),
+    orderIds: orders.map((o) => o.id!).filter(Boolean),
+    tripCount: orders.length,
+  };
+}
+
+async function loadPayoutDaySources(
+  driverUid: string,
+  dateStr: string,
+  orderFallback: Order[] = []
+): Promise<{ records: DriverDeliveryRecord[]; orders: Order[] }> {
+  const records = dedupeDriverDeliveryRecords(
+    await getDriverDeliveryRecordsForDate(driverUid, dateStr)
+  );
+  const orders =
+    orderFallback.length > 0
+      ? uniqueOrdersForPayout(orderFallback)
+      : uniqueOrdersForPayout(await getDriverDeliveredOrdersForDate(driverUid, dateStr));
+  return { records, orders };
+}
+
+/** One payout per driver per day — prefer canonical doc / paid when legacy duplicates exist. */
+export function dedupeDriverDailyPayouts(payouts: DriverDailyPayout[]): DriverDailyPayout[] {
+  const byKey = new Map<string, DriverDailyPayout>();
+  for (const payout of payouts) {
+    const key = `${payout.driverUid}|${normalizePayoutDate(payout.date)}`;
+    const prev = byKey.get(key);
+    byKey.set(key, prev ? preferDriverDailyPayout(prev, payout) : payout);
+  }
+  return [...byKey.values()].sort((a, b) => b.date.localeCompare(a.date));
+}
+
+async function deleteLegacyDuplicateDailyPayouts(
+  driverUid: string,
+  dateStr: string,
+  keepDocId: string
+): Promise<void> {
+  const normalized = normalizePayoutDate(dateStr);
+  const snap = await getDocs(
+    query(collection(db, 'driverDailyPayouts'), where('driverUid', '==', driverUid))
+  );
+  await Promise.all(
+    snap.docs
+      .filter((d) => {
+        if (d.id === keepDocId) return false;
+        const data = d.data() as DriverDailyPayout;
+        return normalizePayoutDate(data.date) === normalized;
+      })
+      .map((d) => deleteDoc(d.ref))
+  );
+}
+
+export const markDriverDailyPayoutPaid = async (
+  payoutId: string,
+  adminUid: string
+): Promise<void> => {
+  const payoutRef = doc(db, 'driverDailyPayouts', payoutId);
+  const snap = await getDoc(payoutRef);
+  if (!snap.exists()) throw new Error('Payout not found');
+  if ((snap.data() as DriverDailyPayout).status === 'paid') return;
+
+  const now = Timestamp.now();
+  await updateDoc(payoutRef, {
+    status: 'paid',
+    paidAt: now,
+    paidByAdminUid: adminUid,
+    updatedAt: now,
+  });
+};
+
+export const upsertDriverDailyPayout = async (
+  driverUid: string,
+  driverName: string,
+  dateStr: string,
+  orders: Order[] = [],
+  payoutUpiId?: string
+): Promise<string> => {
+  const { records, orders: uniqueOrders } = await loadPayoutDaySources(
+    driverUid,
+    dateStr,
+    orders
+  );
+  const totals = aggregatePayoutTotals(records, uniqueOrders);
+  const now = Timestamp.now();
+  const docId = driverDailyPayoutDocId(driverUid, dateStr);
+  const payoutRef = doc(db, 'driverDailyPayouts', docId);
+  const existingSnap = await getDoc(payoutRef);
+  const existing = existingSnap.exists()
+    ? ({ id: existingSnap.id, ...existingSnap.data() } as DriverDailyPayout)
+    : undefined;
+
+  const payload = {
+    driverUid,
+    driverName,
+    date: normalizePayoutDate(dateStr),
+    jarsDelivered: totals.jarsDelivered,
+    distanceKm: Math.round(totals.distanceKm * 100) / 100,
+    amount: totals.amount,
+    payoutUpiId: payoutUpiId || existing?.payoutUpiId || '',
+    status: (existing?.status === 'paid' ? 'paid' : 'pending') as 'pending' | 'paid',
+    orderIds: totals.orderIds,
+    tripCount: totals.tripCount,
+    updatedAt: now,
+  };
+
+  if (!existingSnap.exists()) {
+    await setDoc(payoutRef, { ...payload, createdAt: now });
+  } else {
+    await updateDoc(payoutRef, payload);
+  }
+
+  await deleteLegacyDuplicateDailyPayouts(driverUid, dateStr, docId);
+  return docId;
+};
+
+/** Refresh one day's payout doc from delivery records (real-time source of truth). */
+export const refreshDriverDailyPayoutForDate = async (
+  driverUid: string,
+  driverName: string,
+  dateStr: string,
+  payoutUpiId?: string
+): Promise<void> => {
+  await upsertDriverDailyPayout(driverUid, driverName, dateStr, [], payoutUpiId);
+};
+
+export const recordDriverDailyPayoutPaid = async (
+  driverUid: string,
+  driverName: string,
+  dateStr: string,
+  payoutUpiId: string | undefined,
+  adminUid: string
+): Promise<void> => {
+  const docId = await upsertDriverDailyPayout(
+    driverUid,
+    driverName,
+    dateStr,
+    [],
+    payoutUpiId
+  );
+  await markDriverDailyPayoutPaid(docId, adminUid);
+};
+
+/** Rebuild payout rows from Delivery Records (same source as admin Records page). */
+export const syncDriverDailyPayoutsFromRecords = async (
+  driverUid: string,
+  driverName: string,
+  payoutUpiId?: string
+): Promise<void> => {
+  const recordSnap = await getDocs(
+    query(collection(db, 'driverDeliveryRecords'), where('driverUid', '==', driverUid))
+  );
+  const allRecords = dedupeDriverDeliveryRecords(
+    recordSnap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverDeliveryRecord)
+  );
+
+  const dates = new Set<string>([todayKey()]);
+  for (const record of allRecords) {
+    if (record.deliveryDate) dates.add(normalizePayoutDate(record.deliveryDate));
+  }
+
+  const payoutSnap = await getDocs(
+    query(collection(db, 'driverDailyPayouts'), where('driverUid', '==', driverUid))
+  );
+  for (const d of payoutSnap.docs) {
+    const date = normalizePayoutDate((d.data() as DriverDailyPayout).date);
+    if (date) dates.add(date);
+  }
+
+  for (const dateStr of dates) {
+    await upsertDriverDailyPayout(driverUid, driverName, dateStr, [], payoutUpiId);
+  }
+};
+
+/** Rebuild every daily payout row for a driver and remove duplicate docs. */
+export const reconcileDriverDailyPayoutDuplicates = async (
+  driverUid: string,
+  driverName: string,
+  payoutUpiId?: string
+): Promise<void> => {
+  await syncDriverDailyPayoutsFromRecords(driverUid, driverName, payoutUpiId);
+};
+
+function countJarsFromItems(items: Order['items'] = []): number {
+  return items.reduce((sum, item) => sum + item.quantity, 0);
+}
+
+export const subscribeToDriverDailyPayouts = (
+  callback: (payouts: DriverDailyPayout[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const ref = collection(db, 'driverDailyPayouts');
+  const q = query(ref, orderBy('date', 'desc'));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverDailyPayout);
+      callback(dedupeDriverDailyPayouts(list));
+    },
+    (err) => {
+      console.error('subscribeToDriverDailyPayouts error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const subscribeToDriverDailyPayoutsForDriver = (
+  driverUid: string,
+  callback: (payouts: DriverDailyPayout[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(collection(db, 'driverDailyPayouts'), where('driverUid', '==', driverUid));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverDailyPayout);
+      callback(
+        dedupeDriverDailyPayouts(list).sort((a, b) => b.date.localeCompare(a.date))
+      );
+    },
+    (err) => {
+      console.error('subscribeToDriverDailyPayoutsForDriver error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+/**
+ * Archive a delivered order into Delivery Records (idempotent).
+ * Called automatically when the driver marks delivered; optional adminUid for manual verify.
+ * Stores time required = deliveredAt − deliveryStartedAt (falls back to assignedAt).
+ */
+export const archiveDeliveredOrderToRecords = async (
+  orderId: string,
+  archivedByUid?: string
+): Promise<void> => {
+  const orderRef = doc(db, 'orders', orderId);
+  const recordRef = doc(db, 'driverDeliveryRecords', orderId);
+  let refreshPayout: { driverUid: string; driverName: string; dateStr: string } | null = null;
+
+  await runTransaction(db, async (transaction) => {
+    const orderSnap = await transaction.get(orderRef);
+    if (!orderSnap.exists()) {
+      throw new Error('Order not found');
+    }
+    const order = { id: orderSnap.id, ...orderSnap.data() } as Order;
+    if (order.status !== 'delivered') {
+      throw new Error('Order is not delivered yet');
+    }
+    if (!order.deliveryPersonUid) {
+      throw new Error('No driver assigned to this order');
+    }
+
+    const deliveredAt = order.deliveredAt ?? order.updatedAt;
+    const deliveryDate = deliveredAt ? todayKey(deliveredAt.toDate()) : todayKey();
+    const tripKm = orderTripTotalKm(order);
+
+    refreshPayout = {
+      driverUid: order.deliveryPersonUid,
+      driverName: order.deliveryPersonName || '',
+      dateStr: deliveryDate,
+    };
+
+    if (order.adminVerified) {
+      return;
+    }
+
+    const existingRecord = await transaction.get(recordRef);
+    const now = Timestamp.now();
+    const byUid = archivedByUid || order.deliveryPersonUid || 'system';
+
+    if (existingRecord.exists()) {
+      transaction.update(recordRef, {
+        jarCount: order.jarCount ?? countJarsFromItems(order.items),
+        distanceKm: tripKm,
+        driverToShopKm: order.driverToShopKm ?? null,
+        shopToCustomerKm: order.shopToCustomerKm ?? null,
+        driverEarnings: order.driverTotalEarnings ?? order.driverFee ?? 0,
+        deliveryDate,
+        deliveredAt: deliveredAt ?? null,
+      });
+      transaction.update(orderRef, {
+        adminVerified: true,
+        adminVerifiedAt: now,
+        adminVerifiedBy: byUid,
+        updatedAt: now,
+      });
+      return;
+    }
+
+    const startedAt = order.deliveryStartedAt ?? order.adminAssignedAt;
+    let durationMinutes: number | undefined;
+    if (deliveredAt && startedAt) {
+      durationMinutes = Math.max(
+        0,
+        Math.round((deliveredAt.toMillis() - startedAt.toMillis()) / 60000)
+      );
+    }
+
+    transaction.set(recordRef, {
+      orderId: order.id,
+      orderOrderId: order.orderId,
+      driverUid: order.deliveryPersonUid,
+      driverName: order.deliveryPersonName || '',
+      vendorShopName: order.vendorShopName,
+      vendorAddress: order.vendorAddress || '',
+      customerAddress: order.customerAddress,
+      customerName: order.customerName,
+      jarCount: order.jarCount ?? countJarsFromItems(order.items),
+      distanceKm: tripKm,
+      driverToShopKm: order.driverToShopKm ?? null,
+      shopToCustomerKm: order.shopToCustomerKm ?? null,
+      driverEarnings: order.driverTotalEarnings ?? order.driverFee ?? 0,
+      deliveryDate,
+      assignedAt: order.adminAssignedAt ?? null,
+      deliveryStartedAt: order.deliveryStartedAt ?? null,
+      deliveredAt: deliveredAt ?? null,
+      durationMinutes: durationMinutes ?? null,
+      verifiedAt: now,
+      verifiedByAdminUid: byUid,
+      createdAt: now,
+    });
+
+    transaction.update(orderRef, {
+      adminVerified: true,
+      adminVerifiedAt: now,
+      adminVerifiedBy: byUid,
+      updatedAt: now,
+    });
+  });
+
+  if (refreshPayout) {
+    try {
+      let payoutUpiId: string | undefined;
+      try {
+        const driver = await getUserDocument(refreshPayout.driverUid);
+        payoutUpiId = driver?.payoutUpiId;
+        if (!refreshPayout.driverName && driver?.name) {
+          refreshPayout.driverName = driver.name;
+        }
+      } catch {
+        /* ignore */
+      }
+      await refreshDriverDailyPayoutForDate(
+        refreshPayout.driverUid,
+        refreshPayout.driverName,
+        refreshPayout.dateStr,
+        payoutUpiId
+      );
+    } catch (e) {
+      console.warn('Failed to refresh daily payout after archive', e);
+    }
+  }
+};
+
+/** @deprecated Prefer archiveDeliveredOrderToRecords — kept for older admin verify UI */
+export const verifyDriverDeliveryRecord = async (
+  orderId: string,
+  adminUid: string
+): Promise<void> => archiveDeliveredOrderToRecords(orderId, adminUid);
+
+export const subscribeToDriverDeliveryRecords = (
+  callback: (records: DriverDeliveryRecord[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(collection(db, 'driverDeliveryRecords'), orderBy('verifiedAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverDeliveryRecord));
+    },
+    (err) => {
+      console.error('subscribeToDriverDeliveryRecords error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const subscribeToDriverDeliveryRecordsForDriver = (
+  driverUid: string,
+  callback: (records: DriverDeliveryRecord[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(
+    collection(db, 'driverDeliveryRecords'),
+    where('driverUid', '==', driverUid)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as DriverDeliveryRecord);
+      callback(dedupeDriverDeliveryRecords(list));
+    },
+    (err) => {
+      console.error('subscribeToDriverDeliveryRecordsForDriver error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+/**
+ * Recompute total km with the same algorithm as the delivery app map legend
+ * (You→Shop + Shop→Customer) and write it onto the order (and record if present).
+ */
+export const repairOrderRoadDistance = async (
+  orderId: string
+): Promise<{ distanceKm: number; driverToShopKm?: number; shopToCustomerKm?: number } | null> => {
+  const order = await getOrderById(orderId);
+  if (!order) return null;
+
+  // Keep km exactly as saved from delivery dashboard map at mark-delivered
+  if (
+    order.mapKmFromDelivery &&
+    order.driverToShopKm != null &&
+    order.shopToCustomerKm != null
+  ) {
+    const distanceKm = orderTripTotalKm(order);
+    return {
+      distanceKm,
+      driverToShopKm: order.driverToShopKm,
+      shopToCustomerKm: order.shopToCustomerKm,
+    };
+  }
+
+  let vendor: Vendor | null = null;
+  try {
+    vendor = await getVendorByUid(order.vendorUid);
+  } catch {
+    vendor = null;
+  }
+
+  let driverLat: number | undefined;
+  let driverLng: number | undefined;
+  if (order.deliveryPersonUid) {
+    try {
+      const driver = await getUserDocument(order.deliveryPersonUid);
+      if (driver?.latitude != null && driver?.longitude != null) {
+        driverLat = driver.latitude;
+        driverLng = driver.longitude;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const trip = await computeDeliveryMapTotalDistance({
+    driverLat,
+    driverLng,
+    shopLat: vendor?.latitude ?? order.vendorLatitude,
+    shopLng: vendor?.longitude ?? order.vendorLongitude,
+    shopAddress: vendor?.address ?? order.vendorAddress,
+    shopName: order.vendorShopName,
+    shopPincode: vendor?.pincode,
+    customerLat: order.latitude,
+    customerLng: order.longitude,
+    customerAddress: order.customerAddress,
+    customerPincode: order.customerPincode,
+  });
+
+  if (trip.totalKm == null) return null;
+
+  await updateOrderDocument(orderId, {
+    distanceKm: trip.totalKm,
+    ...(trip.driverToShopKm != null ? { driverToShopKm: trip.driverToShopKm } : {}),
+    ...(trip.shopToCustomerKm != null ? { shopToCustomerKm: trip.shopToCustomerKm } : {}),
+  });
+
+  // Best-effort: keep matching delivery record in sync (doc id = order id)
+  try {
+    const recordRef = doc(db, 'driverDeliveryRecords', orderId);
+    const recordSnap = await getDoc(recordRef);
+    if (recordSnap.exists()) {
+      await updateDoc(recordRef, {
+        distanceKm: trip.totalKm,
+        driverToShopKm: trip.driverToShopKm ?? null,
+        shopToCustomerKm: trip.shopToCustomerKm ?? null,
+      });
+    }
+  } catch (e) {
+    console.warn('Could not sync repaired km onto delivery record', e);
+  }
+
+  try {
+    const order = await getOrderById(orderId);
+    if (order?.deliveryPersonUid && order.status === 'delivered') {
+      const doneAt = order.deliveredAt ?? order.updatedAt;
+      if (doneAt) {
+        let payoutUpiId: string | undefined;
+        try {
+          const driver = await getUserDocument(order.deliveryPersonUid);
+          payoutUpiId = driver?.payoutUpiId;
+        } catch {
+          /* ignore */
+        }
+        await refreshDriverDailyPayoutForDate(
+          order.deliveryPersonUid,
+          order.deliveryPersonName || '',
+          todayKey(doneAt.toDate()),
+          payoutUpiId
+        );
+      }
+    }
+  } catch (e) {
+    console.warn('Could not refresh payout after km repair', e);
+  }
+
+  return {
+    distanceKm: trip.totalKm,
+    driverToShopKm: trip.driverToShopKm,
+    shopToCustomerKm: trip.shopToCustomerKm,
+  };
+};
+
+/**
+ * Copy delivery-map km from order onto its record (for payout sync).
+ */
+export const syncDeliveryRecordKmFromOrder = async (orderId: string): Promise<void> => {
+  const order = await getOrderById(orderId);
+  if (!order?.mapKmFromDelivery) return;
+
+  const tripKm = orderTripTotalKm(order);
+  const recordRef = doc(db, 'driverDeliveryRecords', orderId);
+  const recordSnap = await getDoc(recordRef);
+  if (!recordSnap.exists()) return;
+
+  await updateDoc(recordRef, {
+    distanceKm: tripKm,
+    driverToShopKm: order.driverToShopKm ?? null,
+    shopToCustomerKm: order.shopToCustomerKm ?? null,
+  });
+};
+
+/**
+ * Recompute total km for a delivery record + its order.
+ */
+export const repairDeliveryRecordRoadDistance = async (
+  record: DriverDeliveryRecord
+): Promise<{ distanceKm: number; driverToShopKm?: number; shopToCustomerKm?: number } | null> => {
+  if (!record.orderId) return null;
+  return repairOrderRoadDistance(record.orderId);
+};
+
+export interface CustomerComplaint {
+  id?: string;
+  customerUid: string;
+  customerName: string;
+  customerPhone?: string;
+  vendorUid: string;
+  vendorShopName: string;
+  city?: string;
+  state?: string;
+  pincode?: string;
+  content: string;
+  status: 'open' | 'resolved';
+  resolvedAt?: Timestamp;
+  resolvedByAdminUid?: string;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+export interface CustomerNotification {
+  id?: string;
+  customerUid: string;
+  type: 'complaint_resolved';
+  complaintId: string;
+  title: string;
+  message: string;
+  read: boolean;
+  createdAt: Timestamp;
+}
+
+export const createCustomerComplaint = async (params: {
+  customerUid: string;
+  customerName: string;
+  customerPhone?: string;
+  vendorUid: string;
+  vendorShopName: string;
+  city?: string;
+  state?: string;
+  pincode?: string;
+  content: string;
+}): Promise<string> => {
+  const now = Timestamp.now();
+  const ref = await addDoc(collection(db, 'customerComplaints'), {
+    customerUid: params.customerUid,
+    customerName: params.customerName,
+    customerPhone: params.customerPhone ?? '',
+    vendorUid: params.vendorUid,
+    vendorShopName: params.vendorShopName,
+    city: params.city ?? '',
+    state: params.state ?? '',
+    pincode: params.pincode ?? '',
+    content: params.content.trim(),
+    status: 'open',
+    createdAt: now,
+    updatedAt: now,
+  });
+  return ref.id;
+};
+
+export const subscribeToComplaintsForCustomer = (
+  customerUid: string,
+  callback: (complaints: CustomerComplaint[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(
+    collection(db, 'customerComplaints'),
+    where('customerUid', '==', customerUid)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as CustomerComplaint)
+        .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+      callback(list);
+    },
+    (err) => {
+      console.error('subscribeToComplaintsForCustomer error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+/** Resolved if status field or resolvedAt timestamp is set. */
+export function isComplaintResolved(complaint: CustomerComplaint): boolean {
+  return complaint.status === 'resolved' || !!complaint.resolvedAt;
+}
+
+export const subscribeToCustomerComplaintsForAdmin = (
+  callback: (complaints: CustomerComplaint[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(collection(db, 'customerComplaints'), orderBy('createdAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as CustomerComplaint));
+    },
+    (err) => {
+      console.error('subscribeToCustomerComplaintsForAdmin error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const resolveCustomerComplaint = async (
+  complaintId: string,
+  adminUid: string
+): Promise<void> => {
+  const complaintRef = doc(db, 'customerComplaints', complaintId);
+  const snap = await getDoc(complaintRef);
+  if (!snap.exists()) throw new Error('Complaint not found');
+  const complaint = { id: snap.id, ...snap.data() } as CustomerComplaint;
+  if (complaint.status === 'resolved') return;
+
+  const now = Timestamp.now();
+
+  await updateDoc(complaintRef, {
+    status: 'resolved',
+    resolvedAt: now,
+    resolvedByAdminUid: adminUid,
+    updatedAt: now,
+  });
+
+  try {
+    await addDoc(collection(db, 'customerNotifications'), {
+      customerUid: complaint.customerUid,
+      type: 'complaint_resolved',
+      complaintId,
+      title: 'Complaint resolved',
+      message: `Your complaint about ${complaint.vendorShopName} has been resolved by admin.`,
+      read: false,
+      createdAt: now,
+    });
+  } catch (e) {
+    console.error('Failed to create customer notification (complaint still resolved):', e);
+  }
+};
+
+export const subscribeToCustomerNotifications = (
+  customerUid: string,
+  callback: (notifications: CustomerNotification[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe => {
+  const q = query(
+    collection(db, 'customerNotifications'),
+    where('customerUid', '==', customerUid)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as CustomerNotification)
+        .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0))
+        .slice(0, 30);
+      callback(list);
+    },
+    (err) => {
+      console.error('subscribeToCustomerNotifications error:', err);
+      onError?.(err as Error);
+    }
+  );
+};
+
+export const markCustomerNotificationRead = async (notificationId: string): Promise<void> => {
+  await updateDoc(doc(db, 'customerNotifications', notificationId), { read: true });
 };

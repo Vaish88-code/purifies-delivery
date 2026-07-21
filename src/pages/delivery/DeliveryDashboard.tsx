@@ -12,6 +12,9 @@ import {
   ToggleLeft,
   ToggleRight,
   Clock,
+  Gift,
+  Trophy,
+  Wallet,
 } from 'lucide-react';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
 import L, { type LatLngExpression } from 'leaflet';
@@ -22,7 +25,7 @@ import { Label } from '@shared/components/ui/label';
 import { Logo } from '@shared/components/Logo';
 import { LanguageSelector } from '@shared/components/LanguageSelector';
 import { useAuth, useTranslation } from '@shared/contexts/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { useToast } from '@shared/hooks/use-toast';
 import {
   getOrdersByDeliveryPerson,
@@ -31,47 +34,49 @@ import {
   subscribeToOrdersByDeliveryPerson,
   getVendorByUid,
   updateUserLocationWithPermission,
+  finalizeDriverEarningsForOrder,
+  archiveDeliveredOrderToRecords,
+  uploadDriverProfilePhoto,
 } from '@shared/lib/firebase/firestore';
 import { Order } from '@shared/lib/firebase/firestore';
 import { formatDistanceToNow } from 'date-fns';
-import { doc, updateDoc, Timestamp } from 'firebase/firestore';
+import { doc, updateDoc, Timestamp, deleteField } from 'firebase/firestore';
 import { db } from '@shared/lib/firebase';
-import { haversineMeters } from '@shared/utils/geo';
+import { haversineMeters, fetchDrivingRoute, computeDeliveryMapTotalDistance } from '@shared/utils/geo';
+import { resolveOrderMapCoordinates, buildNavigationAddressLines } from '@shared/utils/geo';
+import { PLATFORM_FEES, getDriverTier } from '@shared/utils/platformFees';
+import { isOrderForDriverDashboardToday } from '@shared/utils/deliveryOrderFilters';
 
 const LOCATION_SYNC_MIN_MS = 20000;
 const LOCATION_SYNC_MIN_MOVE_M = 40;
 
-const GEO_REGION = 'Kolhapur, Maharashtra, India';
 const KOLHAPUR_CENTER: LatLngExpression = [16.705, 74.2433];
 
-async function geocodeOne(query: string): Promise<LatLngExpression | null> {
-  if (!query || !query.trim()) return null;
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query.trim())}&limit=1`;
-  const res = await fetch(url, {
-    headers: { Accept: 'application/json', 'User-Agent': 'Purifies-Delivery/1.0' },
+function mapCoordKey(pos: LatLngExpression | null): string {
+  if (!pos || !Array.isArray(pos)) return '';
+  return `${pos[0].toFixed(5)},${pos[1].toFixed(5)}`;
+}
+
+/** Emoji map pins — easy to tell shop / customer / delivery person apart */
+function createEmojiMapIcon(emoji: string, label: string) {
+  return L.divIcon({
+    className: 'purifies-emoji-marker',
+    html: `<div style="
+      font-size: 28px;
+      line-height: 1;
+      text-align: center;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45));
+      user-select: none;
+    " title="${label}" aria-label="${label}">${emoji}</div>`,
+    iconSize: [36, 36],
+    iconAnchor: [18, 32],
+    popupAnchor: [0, -28],
   });
-  if (!res.ok) return null;
-  const data = await res.json();
-  if (!Array.isArray(data) || data.length === 0) return null;
-  const { lat, lon } = data[0];
-  return [parseFloat(lat), parseFloat(lon)];
 }
 
-async function geocodeAddress(address: string): Promise<LatLngExpression | null> {
-  if (!address || !address.trim()) return null;
-  const q = [address.trim(), GEO_REGION].filter(Boolean).join(', ');
-  return geocodeOne(q);
-}
-
-/** Try multiple queries for better success (full address, then pincode+region, then place+region). */
-async function geocodeWithFallbacks(queries: string[]): Promise<LatLngExpression | null> {
-  for (const q of queries) {
-    if (!q || !q.trim()) continue;
-    const result = await geocodeOne(q.trim());
-    if (result) return result;
-  }
-  return null;
-}
+const driverMapIcon = createEmojiMapIcon('🏍️', 'Delivery person');
+const shopMapIcon = createEmojiMapIcon('🫙', 'Shop');
+const customerMapIcon = createEmojiMapIcon('🏠', 'Customer');
 
 function FitBoundsToRoute({
   driver,
@@ -127,6 +132,10 @@ export default function DeliveryDashboard() {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [selectedShopAddress, setSelectedShopAddress] = useState<string | null>(null);
   const [selectedCustomerAddress, setSelectedCustomerAddress] = useState<string | null>(null);
+  const [routeDriverToShop, setRouteDriverToShop] = useState<[number, number][]>([]);
+  const [routeShopToCustomer, setRouteShopToCustomer] = useState<[number, number][]>([]);
+  const [kmDriverToShop, setKmDriverToShop] = useState<number | null>(null);
+  const [kmShopToCustomer, setKmShopToCustomer] = useState<number | null>(null);
   const [locatingOrderId, setLocatingOrderId] = useState<string | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
@@ -135,6 +144,13 @@ export default function DeliveryDashboard() {
   const [profileAddress, setProfileAddress] = useState(user?.address || '');
   const [profileCity, setProfileCity] = useState('');
   const [profileState, setProfileState] = useState(user?.state || '');
+  const [walletBalance, setWalletBalance] = useState(0);
+  const [streakCount, setStreakCount] = useState(0);
+  const [monthlyOrderCount, setMonthlyOrderCount] = useState(0);
+  const [profilePhotoUrl, setProfilePhotoUrl] = useState('');
+  const [profileAadhaar, setProfileAadhaar] = useState('');
+  const [profileUpiId, setProfileUpiId] = useState('');
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
   // Default map center (India) for OpenStreetMap
   const defaultCenter: LatLngExpression = [20.5937, 78.9629];
@@ -150,6 +166,12 @@ export default function DeliveryDashboard() {
         if (userDoc) {
           // Default to true (available) if not set (backward compatibility)
           setIsAvailable(userDoc.isAvailable !== false);
+          setWalletBalance(userDoc.walletBalance ?? 0);
+          setStreakCount(userDoc.streakCount ?? 0);
+          setMonthlyOrderCount(userDoc.monthlyOrderCount ?? userDoc.lifetimeDeliveries ?? 0);
+          setProfilePhotoUrl(userDoc.profilePhotoUrl ?? '');
+          setProfileAadhaar(userDoc.aadhaarNumber ?? '');
+          setProfileUpiId(userDoc.payoutUpiId ?? '');
         }
       } catch (error) {
         console.error('Error fetching user availability:', error);
@@ -337,6 +359,13 @@ export default function DeliveryDashboard() {
         address: fullAddress || undefined,
         state: profileState.trim() || undefined,
       });
+      if (user.id) {
+        await updateDoc(doc(db, 'users', user.id), {
+          payoutUpiId: profileUpiId.trim() || deleteField(),
+          aadhaarNumber: profileAadhaar.trim() || deleteField(),
+          updatedAt: Timestamp.now(),
+        });
+      }
       toast({
         title: 'Profile updated',
         description: 'Your name, phone, and address have been updated.',
@@ -351,6 +380,25 @@ export default function DeliveryDashboard() {
       });
     } finally {
       setSavingProfile(false);
+    }
+  };
+
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!user?.id || !e.target.files?.[0]) return;
+    try {
+      setUploadingPhoto(true);
+      const url = await uploadDriverProfilePhoto(user.id, e.target.files[0]);
+      await updateDoc(doc(db, 'users', user.id), {
+        profilePhotoUrl: url,
+        updatedAt: Timestamp.now(),
+      });
+      setProfilePhotoUrl(url);
+      toast({ title: 'Photo updated', description: 'Profile photo saved.' });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Upload failed';
+      toast({ title: 'Error', description: message, variant: 'destructive' });
+    } finally {
+      setUploadingPhoto(false);
     }
   };
 
@@ -410,18 +458,98 @@ export default function DeliveryDashboard() {
   };
 
   const handleMarkDelivered = async (orderId: string) => {
-    if (updatingOrderId) return;
+    if (updatingOrderId || !user?.id) return;
 
     try {
       setUpdatingOrderId(orderId);
-      await updateOrderDocument(orderId, { status: 'delivered' });
-      
-      // Real-time listener will automatically update the orders
-      // No need to manually refresh
-      
+      const order = orders.find((o) => o.id === orderId);
+      if (!order) {
+        throw new Error('Order not found');
+      }
+
+      // Use live map legend km when this order is on the map; never reuse admin-assign estimate
+      const mapOpenForOrder = selectedOrderId === (order.id || order.orderId);
+      let driverToShopKm: number | undefined =
+        mapOpenForOrder && kmDriverToShop != null ? kmDriverToShop : undefined;
+      let shopToCustomerKm: number | undefined =
+        mapOpenForOrder && kmShopToCustomer != null ? kmShopToCustomer : undefined;
+
+      if (
+        (driverToShopKm == null || shopToCustomerKm == null) &&
+        order.mapKmFromDelivery &&
+        order.driverToShopKm != null &&
+        order.shopToCustomerKm != null
+      ) {
+        driverToShopKm = order.driverToShopKm;
+        shopToCustomerKm = order.shopToCustomerKm;
+      }
+
+      // Always compute from driver's live GPS (same OSRM routes as the map: Blue + Green)
+      if (driverToShopKm == null || shopToCustomerKm == null) {
+        let vendor: Awaited<ReturnType<typeof getVendorByUid>> = null;
+        try {
+          vendor = await getVendorByUid(order.vendorUid);
+        } catch (_) {}
+
+        const driverLat = Array.isArray(driverPosition)
+          ? (driverPosition as [number, number])[0]
+          : undefined;
+        const driverLng = Array.isArray(driverPosition)
+          ? (driverPosition as [number, number])[1]
+          : undefined;
+
+        const trip = await computeDeliveryMapTotalDistance({
+          driverLat,
+          driverLng,
+          shopLat: vendor?.latitude ?? order.vendorLatitude,
+          shopLng: vendor?.longitude ?? order.vendorLongitude,
+          shopAddress: vendor?.address ?? order.vendorAddress,
+          shopName: order.vendorShopName,
+          shopPincode: vendor?.pincode,
+          customerLat: order.latitude,
+          customerLng: order.longitude,
+          customerAddress: order.customerAddress,
+          customerPincode: order.customerPincode,
+        });
+        driverToShopKm = trip.driverToShopKm ?? driverToShopKm;
+        shopToCustomerKm = trip.shopToCustomerKm ?? shopToCustomerKm;
+      }
+
+      const totalKm =
+        driverToShopKm != null && shopToCustomerKm != null
+          ? Math.round((driverToShopKm + shopToCustomerKm) * 100) / 100
+          : undefined;
+
+      if (totalKm == null) {
+        throw new Error(
+          'Could not calculate trip distance. Open the map or enable location, then try again.'
+        );
+      }
+
+      await updateOrderDocument(orderId, {
+        status: 'delivered',
+        deliveredAt: Timestamp.now(),
+        driverToShopKm,
+        shopToCustomerKm,
+        distanceKm: totalKm,
+        mapKmFromDelivery: true,
+      });
+      try {
+        await finalizeDriverEarningsForOrder(orderId, user.id);
+      } catch (earningsError) {
+        console.warn('Earnings finalization:', earningsError);
+      }
+      try {
+        await archiveDeliveredOrderToRecords(orderId, user.id);
+      } catch (archiveError) {
+        console.warn('Archive to records:', archiveError);
+      }
       toast({
         title: 'Marked as Delivered',
-        description: 'Order has been marked as delivered successfully.',
+        description:
+          totalKm != null
+            ? `Saved · Total ${totalKm.toFixed(2)} km transferred to admin records.`
+            : 'Order completed and saved to delivery records.',
       });
     } catch (error: any) {
       console.error('Error marking order as delivered:', error);
@@ -440,7 +568,10 @@ export default function DeliveryDashboard() {
 
     try {
       setUpdatingOrderId(orderId);
-      await updateOrderDocument(orderId, { status: 'out_for_delivery' });
+      await updateOrderDocument(orderId, {
+        status: 'out_for_delivery',
+        deliveryStartedAt: Timestamp.now(),
+      });
       
       // Real-time listener will automatically update the orders
       // No need to manually refresh
@@ -461,7 +592,7 @@ export default function DeliveryDashboard() {
     }
   };
 
-  // Show vendor shop + customer on map; use device coords when available, else geocode with fallbacks
+  // Map pins use the same full addresses as Google Maps navigation (geocoded first).
   const handleViewOnMap = async (order: Order) => {
     const key = order.id || order.orderId;
     setSelectedOrderId(key);
@@ -471,79 +602,57 @@ export default function DeliveryDashboard() {
     setSelectedCustomerPosition(null);
     setSelectedShopAddress(null);
     setSelectedCustomerAddress(null);
+    setRouteDriverToShop([]);
+    setRouteShopToCustomer([]);
+    setKmDriverToShop(null);
+    setKmShopToCustomer(null);
 
     try {
-      // Build display addresses for Google Maps (shows in search bar)
-      const customerAddr = [order.customerAddress, order.customerPincode].filter(Boolean).join(', ') || order.customerAddress || '';
-      setSelectedCustomerAddress(customerAddr || null);
-
-      let customerPos: LatLngExpression | null = null;
-      const hasStoredCoords =
-        typeof order.latitude === 'number' &&
-        typeof order.longitude === 'number' &&
-        Number.isFinite(order.latitude) &&
-        Number.isFinite(order.longitude);
-
-      if (hasStoredCoords) {
-        customerPos = [order.latitude!, order.longitude!];
-      } else {
-        const customerQueries = [
-          [order.customerAddress, order.customerPincode, GEO_REGION].filter(Boolean).join(', '),
-          order.customerPincode ? `${order.customerPincode}, ${GEO_REGION}` : '',
-          order.customerAddress ? `${order.customerAddress}, India` : '',
-        ].filter(Boolean);
-        customerPos = await geocodeWithFallbacks(customerQueries);
-        if (!customerPos && (order.customerPincode || order.customerAddress)) {
-          customerPos = await geocodeOne(`${order.customerPincode || 'Kolhapur'}, Maharashtra, India`);
-        }
-      }
-      if (!customerPos) {
-        customerPos = KOLHAPUR_CENTER;
-      }
-
       let vendor: Awaited<ReturnType<typeof getVendorByUid>> = null;
       try {
         vendor = await getVendorByUid(order.vendorUid);
       } catch (_) {}
 
-      // Shop address for display and Google Maps
-      const shopAddr = [order.vendorShopName, vendor?.address || order.vendorAddress, vendor?.pincode].filter(Boolean).join(', ') || order.vendorAddress || '';
-      setSelectedShopAddress(shopAddr || null);
+      const shopAddr = vendor?.address || order.vendorAddress;
+      const { shopAddressLine, customerAddressLine } = buildNavigationAddressLines({
+        shopName: order.vendorShopName,
+        shopAddress: shopAddr,
+        shopPincode: vendor?.pincode,
+        customerAddress: order.customerAddress,
+        customerPincode: order.customerPincode,
+      });
 
-      // Prefer vendor's GPS location (set via "Set shop location from GPS") for accuracy
-      let vendorPos: LatLngExpression | null = null;
-      if (vendor && typeof vendor.latitude === 'number' && typeof vendor.longitude === 'number' &&
-          Number.isFinite(vendor.latitude) && Number.isFinite(vendor.longitude)) {
-        vendorPos = [vendor.latitude, vendor.longitude];
-      }
-      if (!vendorPos) {
-        const vendorPincode = vendor?.pincode;
-        const vendorQueries = [
-          [order.vendorShopName, vendor?.address || order.vendorAddress, vendorPincode, GEO_REGION].filter(Boolean).join(', '),
-          [vendor?.address || order.vendorAddress, vendorPincode, GEO_REGION].filter(Boolean).join(', '),
-          [order.vendorAddress, vendorPincode, GEO_REGION].filter(Boolean).join(', '),
-          vendorPincode ? `${vendorPincode}, ${GEO_REGION}` : '',
-          order.vendorShopName ? `${order.vendorShopName}, ${GEO_REGION}` : '',
-        ].filter((q) => q && q !== GEO_REGION);
-        vendorPos = await geocodeWithFallbacks(vendorQueries);
-        if (!vendorPos) {
-          vendorPos = await geocodeOne(`${vendor?.pincode || 'Kolhapur'}, Maharashtra, India`);
-        }
-      }
-      if (!vendorPos) {
-        vendorPos = KOLHAPUR_CENTER;
-      }
+      setSelectedShopAddress(shopAddressLine || null);
+      setSelectedCustomerAddress(customerAddressLine || null);
 
-      setSelectedCustomerPosition(customerPos);
+      const { shop, customer } = await resolveOrderMapCoordinates({
+        shopLat: vendor?.latitude ?? order.vendorLatitude,
+        shopLng: vendor?.longitude ?? order.vendorLongitude,
+        shopAddress: shopAddr,
+        shopName: order.vendorShopName,
+        shopPincode: vendor?.pincode,
+        customerLat: order.latitude,
+        customerLng: order.longitude,
+        customerAddress: order.customerAddress,
+        customerPincode: order.customerPincode,
+      });
+
+      const vendorPos: LatLngExpression = shop
+        ? [shop.lat, shop.lng]
+        : KOLHAPUR_CENTER;
+      const customerPos: LatLngExpression = customer
+        ? [customer.lat, customer.lng]
+        : KOLHAPUR_CENTER;
+
       setSelectedVendorPosition(vendorPos);
+      setSelectedCustomerPosition(customerPos);
 
-      const usedFallback =
-        (customerPos === KOLHAPUR_CENTER || vendorPos === KOLHAPUR_CENTER) &&
-        (!hasStoredCoords || !order.vendorAddress);
-      if (usedFallback) {
+      if (!shop || !customer) {
         toast({
           title: 'Map opened',
-          description: 'One location could not be found; map centered on Kolhapur. Use "Open in Google Maps" for directions.',
+          description:
+            'Could not pin exact location from address. Use Navigate buttons for Google Maps directions.',
+          variant: 'destructive',
         });
       }
     } catch (error: any) {
@@ -554,13 +663,60 @@ export default function DeliveryDashboard() {
       setSelectedCustomerAddress(null);
       toast({
         title: 'Map error',
-        description: error.message || 'Showing default area. Use address to navigate.',
+        description: error.message || 'Showing default area. Use Navigate for directions.',
         variant: 'destructive',
       });
     } finally {
       setLocatingOrderId(null);
     }
   };
+
+  // Fetch road-following routes (OSRM) so Leaflet matches Google Maps–style km
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const shop = Array.isArray(selectedVendorPosition)
+        ? (selectedVendorPosition as [number, number])
+        : null;
+      const customer = Array.isArray(selectedCustomerPosition)
+        ? (selectedCustomerPosition as [number, number])
+        : null;
+      const driver = Array.isArray(driverPosition)
+        ? (driverPosition as [number, number])
+        : null;
+
+      if (shop && customer) {
+        const road = await fetchDrivingRoute(shop[0], shop[1], customer[0], customer[1]);
+        if (cancelled) return;
+        if (road) {
+          setRouteShopToCustomer(road.coordinates);
+          setKmShopToCustomer(road.distanceKm);
+        } else {
+          setRouteShopToCustomer([shop, customer]);
+          setKmShopToCustomer(
+            Math.round((haversineMeters(shop[0], shop[1], customer[0], customer[1]) / 1000) * 100) / 100
+          );
+        }
+      }
+
+      if (driver && shop) {
+        const road = await fetchDrivingRoute(driver[0], driver[1], shop[0], shop[1]);
+        if (cancelled) return;
+        if (road) {
+          setRouteDriverToShop(road.coordinates);
+          setKmDriverToShop(road.distanceKm);
+        } else {
+          setRouteDriverToShop([driver, shop]);
+          setKmDriverToShop(
+            Math.round((haversineMeters(driver[0], driver[1], shop[0], shop[1]) / 1000) * 100) / 100
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedVendorPosition, selectedCustomerPosition, driverPosition]);
 
   // Manual refresh function (for refresh button)
   const fetchOrders = useCallback(async () => {
@@ -606,8 +762,9 @@ export default function DeliveryDashboard() {
   };
 
   // Calculate stats from real orders
-  const assignedOrders = orders.filter(o => o.status === 'accepted' || o.status === 'preparing');
-  const completedOrders = orders.filter(o => o.status === 'delivered');
+  const todayOrders = orders.filter((o) => isOrderForDriverDashboardToday(o));
+  const assignedOrders = todayOrders.filter(o => o.status === 'accepted' || o.status === 'preparing' || o.status === 'out_for_delivery');
+  const completedOrders = todayOrders.filter(o => o.status === 'delivered');
   const monthKey = new Date().toISOString().slice(0, 7);
   const monthDeliveries = completedOrders.filter((order) => {
     if (!order.createdAt) return false;
@@ -615,6 +772,11 @@ export default function DeliveryDashboard() {
     const key = `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, '0')}`;
     return key === monthKey;
   }).length;
+  const driverTier = getDriverTier(monthlyOrderCount);
+  const nextTier = PLATFORM_FEES.driverTiers.find((t) => t.minOrders > monthlyOrderCount);
+  const ordersToNextTier = nextTier ? Math.max(0, nextTier.minOrders - monthlyOrderCount) : 0;
+  const weeklyGoal = PLATFORM_FEES.driverIncentives.weeklyMilestoneDeliveries;
+  const weeklyProgress = Math.min(weeklyGoal, completedOrders.length);
 
   return (
     <div className="min-h-screen bg-background">
@@ -622,6 +784,18 @@ export default function DeliveryDashboard() {
         <div className="container mx-auto px-4 h-16 flex items-center justify-between">
           <Logo size="sm" />
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" asChild className="gap-1">
+              <Link to="/payout-history">
+                <Wallet className="h-4 w-4" />
+                Payouts
+              </Link>
+            </Button>
+            <Button variant="outline" size="sm" asChild className="gap-1">
+              <Link to="/earnings">
+                <IndianRupee className="h-4 w-4" />
+                {t('earnings')}
+              </Link>
+            </Button>
             <span className="text-xs px-2 py-1 rounded-full bg-secondary/10 text-secondary font-medium">{t('delivery')}</span>
             <LanguageSelector />
             <Button variant="ghost" size="sm" onClick={() => { logout(); navigate('/login'); }}>{t('logout')}</Button>
@@ -642,6 +816,19 @@ export default function DeliveryDashboard() {
             <CardContent className="pt-0 space-y-3">
               {editingProfile ? (
                 <div className="space-y-3">
+                  <div className="flex items-center gap-4">
+                    {profilePhotoUrl ? (
+                      <img src={profilePhotoUrl} alt="" className="h-16 w-16 rounded-full object-cover" />
+                    ) : (
+                      <div className="h-16 w-16 rounded-full bg-primary/10 flex items-center justify-center">
+                        <UserIcon className="h-8 w-8 text-primary" />
+                      </div>
+                    )}
+                    <div>
+                      <Label htmlFor="dp-photo">Profile photo</Label>
+                      <Input id="dp-photo" type="file" accept="image/*" onChange={handlePhotoUpload} disabled={uploadingPhoto} />
+                    </div>
+                  </div>
                   <div>
                     <Label htmlFor="dp-name">Name</Label>
                     <Input
@@ -687,6 +874,25 @@ export default function DeliveryDashboard() {
                       />
                     </div>
                   </div>
+                  <div>
+                    <Label htmlFor="dp-upi">UPI ID (for daily pay from admin)</Label>
+                    <Input
+                      id="dp-upi"
+                      value={profileUpiId}
+                      onChange={(e) => setProfileUpiId(e.target.value)}
+                      placeholder="name@upi"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="dp-aadhaar">Aadhaar number</Label>
+                    <Input
+                      id="dp-aadhaar"
+                      value={profileAadhaar}
+                      onChange={(e) => setProfileAadhaar(e.target.value.replace(/\D/g, '').slice(0, 12))}
+                      placeholder="12-digit Aadhaar"
+                      maxLength={12}
+                    />
+                  </div>
                   <div className="flex justify-end gap-2 pt-1">
                     <Button
                       type="button"
@@ -714,6 +920,14 @@ export default function DeliveryDashboard() {
                 </div>
               ) : (
                 <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-start gap-3">
+                    {profilePhotoUrl ? (
+                      <img src={profilePhotoUrl} alt="" className="h-14 w-14 rounded-full object-cover shrink-0" />
+                    ) : (
+                      <div className="h-14 w-14 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                        <UserIcon className="h-7 w-7 text-primary" />
+                      </div>
+                    )}
                   <div className="space-y-1 text-sm">
                     <p className="font-semibold text-base">{user?.name || 'Delivery Partner'}</p>
                     <p className="flex items-center gap-1 text-muted-foreground">
@@ -726,10 +940,11 @@ export default function DeliveryDashboard() {
                         <span>{user.address}</span>
                       </p>
                     )}
-                    {user?.state && (
-                      <p className="text-xs text-muted-foreground">
-                        State: {user.state}
-                      </p>
+                    {profileUpiId && (
+                      <p className="text-xs text-primary">UPI: {profileUpiId}</p>
+                    )}
+                    {profileAadhaar && (
+                      <p className="text-xs text-muted-foreground">Aadhaar: ****{profileAadhaar.slice(-4)}</p>
                     )}
                     {driverPosition && (
                       <p className="text-xs text-muted-foreground flex items-start gap-1.5 pt-1 max-w-md">
@@ -740,6 +955,7 @@ export default function DeliveryDashboard() {
                         </span>
                       </p>
                     )}
+                  </div>
                   </div>
                   <Button
                     type="button"
@@ -800,6 +1016,7 @@ export default function DeliveryDashboard() {
           </CardHeader>
           <CardContent className="h-80 relative">
             <MapContainer
+              key={`${selectedOrderId ?? 'map'}-${mapCoordKey(selectedVendorPosition)}-${mapCoordKey(selectedCustomerPosition)}`}
               center={
                 (selectedCustomerPosition as LatLngExpression) ||
                 (selectedVendorPosition as LatLngExpression) ||
@@ -816,12 +1033,12 @@ export default function DeliveryDashboard() {
                 attribution="&copy; OpenStreetMap contributors"
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-              {/* Driver marker */}
+              {/* Driver marker — 🏍️ */}
               {driverPosition && (
-                <Marker position={driverPosition}>
+                <Marker position={driverPosition} icon={driverMapIcon}>
                   <Popup>
                     <div className="text-sm">
-                      <p className="font-semibold text-blue-600">Your location (Delivery person)</p>
+                      <p className="font-semibold text-blue-600">🏍️ Your location (Delivery person)</p>
                       <p className="text-xs text-muted-foreground mt-1">
                         {Array.isArray(driverPosition)
                           ? `${(driverPosition as [number, number])[0].toFixed(5)}, ${(driverPosition as [number, number])[1].toFixed(5)}`
@@ -831,12 +1048,14 @@ export default function DeliveryDashboard() {
                   </Popup>
                 </Marker>
               )}
-              {/* Vendor shop marker */}
+              {/* Vendor shop marker — 🫙 water jar */}
               {selectedVendorPosition && selectedOrder && (
-                <Marker position={selectedVendorPosition}>
+                <Marker position={selectedVendorPosition} icon={shopMapIcon}>
                   <Popup>
                     <div className="text-sm">
-                      <p className="font-semibold text-amber-600">Shop: {selectedOrder.vendorShopName}</p>
+                      <p className="font-semibold text-amber-600">
+                        🫙 Shop: {selectedOrder.vendorShopName}
+                      </p>
                       {selectedOrder.vendorAddress && (
                         <p className="text-xs mt-1">{selectedOrder.vendorAddress}</p>
                       )}
@@ -849,13 +1068,13 @@ export default function DeliveryDashboard() {
                   </Popup>
                 </Marker>
               )}
-              {/* Customer marker */}
+              {/* Customer marker — 🏠 */}
               {selectedCustomerPosition && selectedOrder && (
-                <Marker position={selectedCustomerPosition}>
+                <Marker position={selectedCustomerPosition} icon={customerMapIcon}>
                   <Popup>
                     <div className="text-sm">
                       <p className="font-semibold text-green-600">
-                        Customer: {selectedOrder.customerName}
+                        🏠 Customer: {selectedOrder.customerName}
                       </p>
                       {selectedOrder.customerAddress && (
                         <p className="text-xs mt-1">{selectedOrder.customerAddress}</p>
@@ -869,18 +1088,18 @@ export default function DeliveryDashboard() {
                   </Popup>
                 </Marker>
               )}
-              {/* Route: Driver → Shop */}
-              {driverPosition && selectedVendorPosition && (
+              {/* Route: Driver → Shop (road path) */}
+              {routeDriverToShop.length >= 2 && (
                 <Polyline
-                  positions={[driverPosition, selectedVendorPosition]}
-                  pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.8 }}
+                  positions={routeDriverToShop}
+                  pathOptions={{ color: '#3b82f6', weight: 5, opacity: 0.85 }}
                 />
               )}
-              {/* Route: Shop → Customer */}
-              {selectedVendorPosition && selectedCustomerPosition && (
+              {/* Route: Shop → Customer (road path) */}
+              {routeShopToCustomer.length >= 2 && (
                 <Polyline
-                  positions={[selectedVendorPosition, selectedCustomerPosition]}
-                  pathOptions={{ color: '#22c55e', weight: 4, opacity: 0.8 }}
+                  positions={routeShopToCustomer}
+                  pathOptions={{ color: '#22c55e', weight: 5, opacity: 0.9 }}
                 />
               )}
               <FitBoundsToRoute
@@ -889,12 +1108,27 @@ export default function DeliveryDashboard() {
                 customer={selectedCustomerPosition}
               />
               <CenterOnDriverButton position={driverPosition} />
-              {/* Legend */}
+              {/* Legend: emoji markers + road km */}
               {(selectedVendorPosition || selectedCustomerPosition) && (
-                <div className="absolute bottom-2 left-2 z-[1000] rounded bg-white/95 dark:bg-zinc-800/95 px-2 py-1.5 text-xs shadow">
-                  <p className="font-medium mb-1">Route</p>
-                  <p className="text-blue-600 dark:text-blue-400">Blue: You → Shop</p>
-                  <p className="text-green-600 dark:text-green-400">Green: Shop → Customer</p>
+                <div className="absolute bottom-2 left-2 z-[1000] rounded bg-white/95 dark:bg-zinc-800/95 px-2 py-1.5 text-xs shadow max-w-[240px]">
+                  <p className="font-medium mb-1">Map</p>
+                  <p className="text-muted-foreground mb-1">
+                    🏍️ You · 🫙 Shop · 🏠 Customer
+                  </p>
+                  <p className="font-medium mb-1 mt-1.5">Road distance</p>
+                  <p className="text-blue-600 dark:text-blue-400">
+                    Blue: You → Shop
+                    {kmDriverToShop != null ? ` · ${kmDriverToShop.toFixed(2)} km` : ''}
+                  </p>
+                  <p className="text-green-600 dark:text-green-400">
+                    Green: Shop → Customer
+                    {kmShopToCustomer != null ? ` · ${kmShopToCustomer.toFixed(2)} km` : ''}
+                  </p>
+                  {kmDriverToShop != null && kmShopToCustomer != null && (
+                    <p className="font-semibold mt-1">
+                      Total {(kmDriverToShop + kmShopToCustomer).toFixed(2)} km
+                    </p>
+                  )}
                 </div>
               )}
             </MapContainer>
@@ -970,9 +1204,71 @@ export default function DeliveryDashboard() {
           </Card>
         </div>
 
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <Card className="card-shadow border-primary/20">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Trophy className="h-4 w-4 text-primary" />
+                Driver Tier
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xl font-bold capitalize">{driverTier.name}</p>
+              <p className="text-xs text-muted-foreground">
+                +{driverTier.payBoost}% pay boost • {driverTier.payoutFrequency} payout cycle
+              </p>
+              <p className="text-xs mt-2 text-primary">
+                {ordersToNextTier > 0 ? `${ordersToNextTier} orders to next tier` : 'Top tier achieved'}
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="card-shadow border-success/20">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm flex items-center gap-2">
+                <IndianRupee className="h-4 w-4 text-success" />
+                Pending Settlement
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xl font-bold text-success">₹{walletBalance.toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground">
+                Directly settled to your account by Admin
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="card-shadow border-warning/20">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Gift className="h-4 w-4 text-warning" />
+                Incentive Progress
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm">
+                Weekly bonus: {weeklyProgress}/{weeklyGoal} deliveries
+              </p>
+              <div className="h-2 rounded-full bg-muted mt-2 overflow-hidden">
+                <div
+                  className="h-full bg-warning"
+                  style={{ width: `${(weeklyProgress / weeklyGoal) * 100}%` }}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                Streak: {streakCount}/{PLATFORM_FEES.driverIncentives.streakOrderCount} for ₹
+                {PLATFORM_FEES.driverIncentives.streakBonus}
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+
         <Card className="card-shadow">
           <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle>{t('assignedDeliveries')}</CardTitle>
+            <div>
+              <CardTitle>{t('assignedDeliveries')}</CardTitle>
+              <p className="text-xs text-muted-foreground mt-1">Today&apos;s orders only — past trips are in admin records</p>
+            </div>
             <Button
               variant="outline"
               size="sm"
@@ -985,7 +1281,7 @@ export default function DeliveryDashboard() {
           <CardContent className="space-y-4">
             {loading ? (
               <p className="text-center text-muted-foreground py-4">{t('loading')}</p>
-            ) : orders.length === 0 ? (
+            ) : todayOrders.length === 0 ? (
               <div className="text-center py-8">
                 <Truck className="h-16 w-16 text-muted-foreground mx-auto mb-4 opacity-50" />
                 <p className="text-muted-foreground font-medium mb-2">{t('noOrdersAssigned')}</p>
@@ -996,7 +1292,7 @@ export default function DeliveryDashboard() {
                 </p>
               </div>
             ) : (
-              orders.map((order) => {
+              todayOrders.map((order) => {
                 // Determine order border color based on status
                 const isDelivered = order.status === 'delivered';
                 const isPending = order.status === 'accepted' || order.status === 'preparing' || order.status === 'pending';

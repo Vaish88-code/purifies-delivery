@@ -195,3 +195,13 @@
   opacity: 0;
 }
 
+/* Leaflet emoji markers (delivery map) */
+.leaflet-div-icon.purifies-emoji-marker {
+  background: transparent !important;
+  border: none !important;
+}
+
+.leaflet-div-icon.purifies-emoji-marker > div {
+  background: transparent;
+}
+

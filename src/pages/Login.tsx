@@ -51,7 +51,7 @@ export default function Login() {
           title: 'Login successful!',
           description: 'Redirecting to delivery dashboard...',
         });
-        setTimeout(() => navigate('/'), 500);
+        setTimeout(() => navigate('/dashboard'), 500);
       } else {
         toast({
           title: 'Login failed',
